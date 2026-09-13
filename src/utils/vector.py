@@ -7,7 +7,7 @@ from pymilvus import Collection, CollectionSchema, DataType, FieldSchema, Milvus
 
 load_dotenv(encoding="utf-8")
 
-COLLECTION_NAME = os.getenv("MILVUS_COLLECTION", "rag_demo_kb")
+COLLECTION_NAME = os.getenv("MILVUS_COLLECTION", "langgraph_rag_kb")
 MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
 MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
 

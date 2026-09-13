@@ -1,4 +1,5 @@
 """生成模块：基于检索结果生成回答，并标注来源溯源。"""
+import re
 from typing import Any, Dict, List
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -56,7 +57,6 @@ def generate(question: str, hits: List[Dict[str, Any]]) -> Dict[str, Any]:
     answer = result.content
 
     # 提取回答中引用的来源编号
-    import re
     cited_indices = set()
     for match in re.finditer(r"\[(\d+)\]", answer):
         idx = int(match.group(1))

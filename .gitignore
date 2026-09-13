@@ -28,3 +28,15 @@ Thumbs.db
 # 临时文件
 *.tmp
 *.bak
+
+# 测试 / 类型检查 / 覆盖率缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 打包构建产物
+build/
+dist/
+*.egg-info/
