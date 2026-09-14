@@ -1,34 +1,34 @@
 """LLM 和 Embedding 工具封装。"""
-import os
-from typing import List
+from typing import Dict, List
 
 import dashscope
-from dotenv import load_dotenv
 from langchain_deepseek import ChatDeepSeek
 
-load_dotenv(encoding="utf-8")
+from ..config import settings
 
-# DeepSeek LLM
-_llm = None
+# 模块导入即配置好 DashScope
+dashscope.api_key = settings.dashscope_api_key
+EMBEDDING_MODEL = settings.embedding_model
+EMBEDDING_DIM = settings.embedding_dim
+
+# 按温度缓存实例：同一温度复用同一客户端，不同节点用不同温度互不影响
+_llm_cache: Dict[float, ChatDeepSeek] = {}
 
 
-def get_llm():
-    """懒加载 DeepSeek 聊天模型。"""
-    global _llm
-    if _llm is None:
-        _llm = ChatDeepSeek(
-            model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
-            api_key=os.getenv("DEEPSEEK_API_KEY"),
-            base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-            temperature=0.3,
+def get_llm(temperature: float = settings.temp_answer) -> ChatDeepSeek:
+    """懒加载 DeepSeek 聊天模型，按温度分别缓存。
+
+    Args:
+        temperature: 采样温度，调用方按节点用途传 settings.temp_* 对应值
+    """
+    if temperature not in _llm_cache:
+        _llm_cache[temperature] = ChatDeepSeek(
+            model=settings.deepseek_model,
+            api_key=settings.deepseek_api_key,
+            base_url=settings.deepseek_base_url,
+            temperature=temperature,
         )
-    return _llm
-
-
-# DashScope Embedding
-dashscope.api_key = os.getenv("DASHSCOPE_API_KEY")
-EMBEDDING_MODEL = "text-embedding-v3"
-EMBEDDING_DIM = 512
+    return _llm_cache[temperature]
 
 
 def get_embeddings(texts: List[str]) -> List[List[float]]:
@@ -38,7 +38,7 @@ def get_embeddings(texts: List[str]) -> List[List[float]]:
         texts: 文本列表
 
     Returns:
-        向量列表，每个向量维度为 EMBEDDING_DIM
+        向量列表，每个向量维度为 settings.embedding_dim
     """
     if not texts:
         return []

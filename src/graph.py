@@ -1,54 +1,124 @@
-"""LangGraph 编排：检索 → 质量评估 →（不合格则重检）→ 生成回答。
+"""LangGraph 多轮 RAG 编排。
 
-单循环设计：检索完成后评估召回片段与问题的相关性，
-相关性过低则根据评估反馈改写查询重新检索，最多重试 MAX_RETRIEVE_RETRIES 次。
+一轮内流程：
+    condense（结合历史把残句补全为独立问题）
+      → retrieve（用独立问题做查询改写+向量检索）
+      → rerank（LLM 精排）
+      → evaluate（相关性评估，不达标带反馈重检）
+      → generate（用用户原话+历史生成，写回消息历史）
+
+会话记忆：State.messages 用 add_messages reducer 累积，配合 checkpointer 按
+thread_id（session_id）持久化；检索/精排/评估用补全后的独立问题以保证召回，
+生成用用户原始问题+历史以保证回答自然、能承接指代。
 """
 import json
-import os
 import re
-from typing import Any, Dict, List, TypedDict
+from typing import Annotated, Any, Dict, List, TypedDict
 
-from dotenv import load_dotenv
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
 
-from .generator import generate
+from .config import settings
+from .generator import format_chat_history, generate
 from .retriever import rerank, retrieve
 from .utils.llm import get_llm
-
-load_dotenv(encoding="utf-8")
-
-MAX_RETRIEVE_RETRIES = int(os.getenv("MAX_RETRIEVE_RETRIES", "2"))
+from .utils.logger import logger
 
 
 class RAGState(TypedDict):
     """RAG 工作流状态。"""
-    question: str
+    # 会话级：消息历史，add_messages 跨轮自动累积
+    messages: Annotated[List[AnyMessage], add_messages]
+    # 本轮工作字段
+    question: str            # 用户本轮原始问题
+    standalone_question: str  # 补全后的独立检索问题
     retrieve_count: int
     hits: List[Dict[str, Any]]
     is_relevant: bool
     feedback: str
     answer: str
     sources: List[Dict[str, Any]]
-    retrieve_error: bool  # 检索是否发生异常（Milvus未启动等），用于区分"服务不可用"和"没匹配到内容"
+    retrieve_error: bool
+
+
+def build_initial_input(question: str) -> Dict[str, Any]:
+    """构造一轮的初始输入：本轮用户消息入历史，同时重置所有单轮工作字段。
+
+    多轮场景下每次 invoke 都调用它，避免 checkpointer 中残留上一轮的 hits/计数。
+    """
+    return {
+        "messages": [HumanMessage(content=question)],
+        "question": question,
+        "standalone_question": "",
+        "retrieve_count": 0,
+        "hits": [],
+        "is_relevant": False,
+        "feedback": "",
+        "answer": "",
+        "sources": [],
+        "retrieve_error": False,
+    }
+
+
+def condense_node(state: RAGState) -> Dict[str, Any]:
+    """问题补全（指代消解）：结合历史把残句改写为脱离上下文也能懂的独立问题。
+
+    首轮（无历史）直接使用原问题，不额外调用 LLM，省一次请求。
+    """
+    question = state["question"]
+    prior_history = state.get("messages", [])[:-1]  # 最后一条是本轮 HumanMessage
+
+    if not prior_history:
+        return {"standalone_question": question}
+
+    history_text = format_chat_history(prior_history)
+    prompt = ChatPromptTemplate.from_template(
+        """你是多轮对话的问题补全助手。请结合历史对话，把用户"当前问题"改写为
+不依赖上下文也能完整理解的独立问题：消解"它/这个/上面那个"等指代、补全省略成分。
+若当前问题本身已经完整，则原样输出。
+
+只输出补全后的问题本身，不要解释、不要引号、不要前缀。
+
+历史对话：
+{history}
+
+当前问题：{question}
+
+补全后的独立问题："""
+    )
+    try:
+        result = (prompt | get_llm(settings.temp_condense)).invoke(
+            {"history": history_text, "question": question}
+        )
+        standalone = result.content.strip().strip("\"'“”").strip()
+        if not standalone:
+            standalone = question
+    except Exception as e:
+        logger.warning(f"问题补全失败，回退原问题: {e}")
+        standalone = question
+
+    if standalone != question:
+        logger.info(f"问题补全: 「{question}」→「{standalone}」")
+    return {"standalone_question": standalone}
 
 
 def retrieve_node(state: RAGState) -> Dict[str, Any]:
-    """检索节点：查询改写 + 向量检索 + 去重，重检时合并旧结果。"""
-    question = state["question"]
+    """检索节点：用补全后的独立问题做查询改写 + 向量检索 + 去重，重检合并旧结果。"""
+    search_query = state.get("standalone_question") or state["question"]
     count = state.get("retrieve_count", 0)
     feedback = state.get("feedback", "")
     old_hits = state.get("hits", [])
 
-    print(f"\n[retrieve] 第 {count + 1} 轮检索...")
+    logger.info(f"第 {count + 1} 轮检索（检索问题：{search_query}）")
 
     try:
-        new_hits, has_error = retrieve(question, feedback=feedback)
+        new_hits, has_error = retrieve(search_query, feedback=feedback)
     except Exception as e:
-        print(f"[retrieve] 检索失败: {e}")
+        logger.error(f"检索节点异常: {e}")
         new_hits, has_error = [], True
 
-    # 合并旧结果和新结果，按文本去重
     seen_texts = {h["text"] for h in old_hits}
     merged = list(old_hits)
     for hit in new_hits:
@@ -56,35 +126,28 @@ def retrieve_node(state: RAGState) -> Dict[str, Any]:
             seen_texts.add(hit["text"])
             merged.append(hit)
 
-    # 按相似度重新排序
     merged.sort(key=lambda x: x["score"], reverse=True)
     return {"hits": merged, "retrieve_count": count + 1, "retrieve_error": has_error}
 
 
 def rerank_node(state: RAGState) -> Dict[str, Any]:
-    """重排序节点：LLM 对检索结果重新打分排序，取 top-k。
-
-    两阶段检索：粗排（向量相似度）→ 精排（LLM 重排序）
-    检索异常时跳过重排，直接返回原结果。
-    """
+    """精排节点：LLM 对粗排结果重排取 top-k；异常或无结果时跳过。"""
     if state.get("retrieve_error") or not state.get("hits"):
-        return {}  # 检索异常或无结果，跳过重排
-
-    print("[rerank] LLM 重排序中...")
-    reranked = rerank(state["question"], state["hits"])
+        return {}
+    search_query = state.get("standalone_question") or state["question"]
+    reranked = rerank(search_query, state["hits"])
     return {"hits": reranked}
 
 
 def evaluate_node(state: RAGState) -> Dict[str, Any]:
-    """检索质量评估：判断召回片段是否与问题相关。"""
-    question = state["question"]
+    """检索质量评估：判断召回片段是否能回答（补全后的）问题。"""
+    search_query = state.get("standalone_question") or state["question"]
     hits = state["hits"]
     count = state.get("retrieve_count", 0)
 
     if not hits:
         return {"is_relevant": False, "feedback": "未检索到任何内容"}
 
-    # 拼接 top-3 片段做评估
     sample = "\n\n".join([h["text"][:300] for h in hits[:3]])
 
     prompt = ChatPromptTemplate.from_template(
@@ -101,7 +164,7 @@ def evaluate_node(state: RAGState) -> Dict[str, Any]:
     )
 
     try:
-        result = (prompt | get_llm()).invoke({"question": question, "sample": sample})
+        result = (prompt | get_llm(settings.temp_eval)).invoke({"question": search_query, "sample": sample})
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", result.content.strip(), flags=re.MULTILINE)
         start, end = text.find("{"), text.rfind("}")
         if start != -1 and end != -1:
@@ -110,82 +173,64 @@ def evaluate_node(state: RAGState) -> Dict[str, Any]:
         is_relevant = bool(parsed.get("is_relevant", True))
         feedback = parsed.get("feedback", "")
     except Exception as e:
-        print(f"[evaluate] 评估失败，默认通过: {e}")
+        logger.warning(f"评估失败，默认通过: {e}")
         is_relevant = True
         feedback = ""
 
-    print(f"[evaluate] 相关性: {'通过' if is_relevant else '不通过'} {feedback}")
+    logger.info(f"相关性评估: {'通过' if is_relevant else '不通过'} {feedback}")
 
-    # 达到最大重试次数强制通过
-    if count >= MAX_RETRIEVE_RETRIES:
-        print(f"[evaluate] 已达最大重试次数 {MAX_RETRIEVE_RETRIES}，强制通过")
+    if count >= settings.max_retrieve_retries:
+        logger.info(f"已达最大重检次数 {settings.max_retrieve_retries}，强制通过")
         is_relevant = True
 
     return {"is_relevant": is_relevant, "feedback": feedback}
 
 
 def generate_node(state: RAGState) -> Dict[str, Any]:
-    """生成节点：基于检索结果生成回答 + 来源溯源。
+    """生成节点：用用户原话 + 历史生成回答、做来源溯源，并把本轮问答写回历史。"""
+    prior_history = state.get("messages", [])[:-1]
 
-    区分两种空结果：
-    - 检索异常（Milvus未启动等）→ 明确提示服务不可用
-    - 检索成功但没匹配 → 提示知识库无相关内容
-    """
-    print("[generate] 生成回答...")
-
-    # 检索异常：不调用 LLM，直接返回服务不可用提示
     if state.get("retrieve_error"):
-        return {
-            "answer": "检索服务暂时不可用（Milvus 连接失败），请检查向量库服务是否启动，或稍后重试。",
-            "sources": [],
-        }
+        answer = "检索服务暂时不可用（向量库连接失败），请检查向量库是否启动，或稍后重试。"
+        sources = []
+    else:
+        try:
+            result = generate(state["question"], state["hits"], history=prior_history)
+            answer, sources = result["answer"], result["sources"]
+        except Exception as e:
+            logger.error(f"生成失败: {e}")
+            answer, sources = f"回答生成失败（{e}），请稍后重试。", []
 
-    try:
-        result = generate(state["question"], state["hits"])
-    except Exception as e:
-        print(f"[generate] 生成失败: {e}")
-        result = {
-            "answer": f"回答生成失败（{e}），请稍后重试。",
-            "sources": [],
-        }
-    return {"answer": result["answer"], "sources": result["sources"]}
+    # 写回本轮 AI 消息（Human 消息已在 build_initial_input 时入历史）
+    return {"answer": answer, "sources": sources, "messages": [AIMessage(content=answer)]}
 
 
 def should_retry(state: RAGState) -> str:
-    """条件边：评估不通过且未达上限则重检，否则生成回答。
-
-    优化：
-    - 检索异常（Milvus未启动等）→ 直接进 generate，不浪费 LLM 重检
-    - 第一次检索就全空 → 直接进 generate（大概率是异常，后续加相似度阈值后也可能是正常空）
-    """
-    # 检索异常 → 直接兜底，不重检
+    """条件边：评估不通过且未达上限则重检，否则生成。"""
     if state.get("retrieve_error"):
         return "generate"
-    # 第一次检索就全空 → 直接兜底
     if not state.get("hits") and state.get("retrieve_count", 0) <= 1:
         return "generate"
-    # 正常情况：评估不通过且未达上限 → 重检
-    if not state.get("is_relevant", True) and state.get("retrieve_count", 0) < MAX_RETRIEVE_RETRIES:
+    if not state.get("is_relevant", True) and state.get("retrieve_count", 0) < settings.max_retrieve_retries:
         return "retrieve"
     return "generate"
 
 
-def build_graph():
-    """构建并编译 RAG 工作流图。
-
-    流程：retrieve（粗排）→ rerank（精排）→ evaluate（质量评估）→ generate（生成+溯源）
-    """
+def build_graph(checkpointer=None):
+    """构建并编译多轮 RAG 图；注入 checkpointer 即可按 thread_id 维持多轮会话。"""
     builder = StateGraph(RAGState)
 
+    builder.add_node("condense", condense_node)
     builder.add_node("retrieve", retrieve_node)
     builder.add_node("rerank", rerank_node)
     builder.add_node("evaluate", evaluate_node)
     builder.add_node("generate", generate_node)
 
-    builder.add_edge(START, "retrieve")
+    builder.add_edge(START, "condense")
+    builder.add_edge("condense", "retrieve")
     builder.add_edge("retrieve", "rerank")
     builder.add_edge("rerank", "evaluate")
     builder.add_conditional_edges("evaluate", should_retry)
     builder.add_edge("generate", END)
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)

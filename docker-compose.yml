@@ -1,8 +1,12 @@
 # ============================================================
-# Milvus standalone 一键部署（etcd + minio + milvus-standalone）
-# 用法：docker compose up -d
-# 说明：若本机已有 Milvus 在 19530 端口运行（如其他项目共用），
-#       则无需重复启动，本项目直接复用即可。
+# 一键部署：Milvus 向量库（etcd + minio + standalone）+ RAG 应用 app
+# 用法（全新环境）：
+#   1. cp .env.example .env，填入你自己的 DEEPSEEK / DASHSCOPE Key
+#   2. docker compose up -d standalone            # 先起向量库
+#   3. docker compose run --rm app python run.py --ingest   # 文档一次性入库
+#   4. docker compose up -d app                   # 起问答服务，访问 http://localhost:8000/docs
+# 说明：若本机已有 Milvus 占用 19530（如其他项目共用），可只起 app 并把
+#       MILVUS_HOST 指向已有实例，无需重复启动下面三个基础服务。
 # ============================================================
 services:
   etcd:
@@ -63,6 +67,26 @@ services:
         condition: service_healthy
     volumes:
       - milvus_data:/var/lib/milvus
+
+  # 问答应用服务
+  app:
+    build: .
+    image: langgraph-rag-qa
+    container_name: rag-app
+    depends_on:
+      standalone:
+        condition: service_healthy   # 等 Milvus 真正可连才启动，避免启动期连接失败
+    env_file:
+      - .env                          # 运行时注入 LLM / Embedding Key，密钥不进镜像
+    environment:
+      # 容器网络内通过服务名 standalone 连 Milvus（不能写 localhost）；
+      # 这里会覆盖 .env 中面向本机的 MILVUS_HOST=localhost
+      - MILVUS_HOST=standalone
+      - MILVUS_PORT=19530
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data:ro           # 挂载知识库文档，更新文档无需重建镜像
 
 volumes:
   etcd_data:

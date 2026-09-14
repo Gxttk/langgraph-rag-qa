@@ -1,8 +1,9 @@
-"""RAG 知识库问答命令行入口。
+"""RAG 知识库问答命令行入口（单轮）。
 
 用法：
   python run.py --ingest              # 将 data/ 目录下的文档入库
-  python run.py "你的问题"             # 提问
+  python run.py "你的问题"             # 单轮提问
+多轮连续对话（客服模式）请使用 chat.py。
 """
 import sys
 from pathlib import Path
@@ -16,14 +17,14 @@ from dotenv import load_dotenv
 load_dotenv(encoding="utf-8")
 
 from src.ingest import ingest_directory
-from src.graph import build_graph
+from src.graph import build_graph, build_initial_input
 
 
 def main():
     if len(sys.argv) < 2:
         print("用法:")
         print("  python run.py --ingest       入库 data/ 目录下的文档")
-        print("  python run.py \"问题\"          提问")
+        print('  python run.py "问题"          单轮提问（多轮对话用 python chat.py）')
         return
 
     arg = sys.argv[1]
@@ -33,22 +34,13 @@ def main():
         ingest_directory(data_dir)
         return
 
-    # 提问模式
+    # 单轮提问（不挂 checkpointer，问完即止）
     question = arg
     print(f"\n问题: {question}")
     print("=" * 60)
 
     graph = build_graph()
-    result = graph.invoke({
-        "question": question,
-        "retrieve_count": 0,
-        "hits": [],
-        "is_relevant": False,
-        "feedback": "",
-        "answer": "",
-        "sources": [],
-        "retrieve_error": False,
-    })
+    result = graph.invoke(build_initial_input(question))
 
     print("\n" + "=" * 60)
     print("【回答】")

@@ -1,0 +1,19 @@
+# 版本控制 / 缓存 / 虚拟环境
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# 密钥：绝不打进镜像，运行时通过 env_file / -e 注入
+.env
+
+# 日志与临时测试文件
+*.log
+body*.json
+sse_out.txt
+
+# 注意：data/ 不忽略，知识库原始文档需要随镜像一起拷贝

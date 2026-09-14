@@ -1,19 +1,14 @@
-"""检索模块：查询改写 + 向量检索 + 结果去重。"""
+"""检索模块：查询改写 + 向量检索 + 结果去重 + LLM 精排。"""
 import json
-import os
 import re
 from typing import Any, Dict, List
 
-from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
 
+from .config import settings
 from .utils.llm import get_embeddings, get_llm
+from .utils.logger import logger
 from .utils.vector import search
-
-load_dotenv(encoding="utf-8")
-
-RETRIEVE_TOP_K = int(os.getenv("RETRIEVE_TOP_K", "4"))
-REWRITE_NUM_QUERIES = int(os.getenv("REWRITE_NUM_QUERIES", "3"))
 
 
 def _clean_json(text: str) -> str:
@@ -24,10 +19,10 @@ def _clean_json(text: str) -> str:
 
 
 def rewrite_query(question: str, feedback: str = "") -> List[str]:
-    """查询改写：将用户口语化提问扩写为多个专业查询词。
+    """查询改写：将用户口语化提问扩写为多个专业查询词（温度略高以增加表达多样性）。
 
     Args:
-        question: 用户原始问题
+        question: 用户问题（多轮场景下为补全后的独立问题）
         feedback: 上一轮检索质量评估的反馈（重检时传入，指导改写方向）
 
     Returns:
@@ -47,8 +42,8 @@ def rewrite_query(question: str, feedback: str = "") -> List[str]:
 请输出："""
     )
     try:
-        result = (prompt | get_llm()).invoke(
-            {"question": question, "n": REWRITE_NUM_QUERIES, "feedback_section": feedback_section}
+        result = (prompt | get_llm(settings.temp_rewrite)).invoke(
+            {"question": question, "n": settings.rewrite_num_queries, "feedback_section": feedback_section}
         )
         text = _clean_json(result.content)
         start, end = text.find("["), text.rfind("]")
@@ -58,15 +53,15 @@ def rewrite_query(question: str, feedback: str = "") -> List[str]:
         if isinstance(queries, list):
             return [str(q) for q in queries if str(q).strip()]
     except Exception as e:
-        print(f"[retriever] 查询改写失败，使用原始问题: {e}")
+        logger.warning(f"查询改写失败，回退原始问题: {e}")
     return [question]
 
 
-def retrieve(question: str, top_k: int = RETRIEVE_TOP_K, feedback: str = "") -> tuple:
+def retrieve(question: str, top_k: int = settings.retrieve_top_k, feedback: str = "") -> tuple:
     """查询改写 + 批量向量检索 + 去重合并。
 
     Args:
-        question: 用户问题
+        question: 用于检索的问题（多轮场景为补全后的独立问题）
         top_k: 每个查询词返回的条数
         feedback: 上一轮评估反馈（重检时传入）
 
@@ -74,13 +69,13 @@ def retrieve(question: str, top_k: int = RETRIEVE_TOP_K, feedback: str = "") -> 
         (hits, has_error): 检索结果列表, 是否发生检索异常
     """
     queries = rewrite_query(question, feedback=feedback)
-    print(f"[retriever] 改写为 {len(queries)} 个查询: {queries}")
+    logger.info(f"改写为 {len(queries)} 个查询: {queries}")
 
     # 批量 embedding，减少 API 调用次数
     try:
         vectors = get_embeddings(queries)
     except Exception as e:
-        print(f"[retriever] embedding 失败: {e}")
+        logger.error(f"embedding 失败: {e}")
         return [], True
 
     all_hits = []
@@ -92,7 +87,7 @@ def retrieve(question: str, top_k: int = RETRIEVE_TOP_K, feedback: str = "") -> 
             hits = search(vector, top_k=top_k)
             success_count += 1
         except Exception as e:
-            print(f"[retriever] 检索失败（已跳过）: {q[:30]}... 错误: {e}")
+            logger.warning(f"单路检索失败（已跳过）: {q[:30]}... 错误: {e}")
             continue
         for hit in hits:
             if hit["text"] not in seen_texts:
@@ -100,34 +95,23 @@ def retrieve(question: str, top_k: int = RETRIEVE_TOP_K, feedback: str = "") -> 
                 all_hits.append(hit)
 
     all_hits.sort(key=lambda x: x["score"], reverse=True)
-    print(f"[retriever] 去重后共 {len(all_hits)} 条结果（成功检索 {success_count}/{len(queries)} 个查询）")
+    logger.info(f"去重后共 {len(all_hits)} 条结果（成功 {success_count}/{len(queries)} 路）")
 
     # 全部查询都失败 → 标记为检索异常
     has_error = (success_count == 0)
     return all_hits, has_error
 
 
-def rerank(question: str, hits: List[Dict[str, Any]], top_k: int = RETRIEVE_TOP_K) -> List[Dict[str, Any]]:
-    """LLM 重排序：根据问题对检索结果重新打分排序，取 top-k。
+def rerank(question: str, hits: List[Dict[str, Any]], top_k: int = settings.retrieve_top_k) -> List[Dict[str, Any]]:
+    """LLM 精排：根据问题对粗排结果重新打分排序，取 top-k（温度 0 求确定性）。
 
-    两阶段检索：
-    - 第一阶段（粗排）：向量相似度快速召回
-    - 第二阶段（精排/Rerank）：LLM 细致判断相关性，重新排序
-
-    Args:
-        question: 用户问题
-        hits: 粗排检索结果
-        top_k: 重排后保留的条数
-
-    Returns:
-        重排后的检索结果
+    两阶段检索：向量相似度粗排召回 → LLM 相关性精排截断。
     """
     if not hits:
         return []
     if len(hits) <= top_k:
         return hits  # 结果不够 top_k，不需要重排
 
-    # 格式化检索结果，带编号
     items_text = []
     for i, h in enumerate(hits, 1):
         items_text.append(f"[{i}] {h['text'][:200]}")
@@ -149,18 +133,17 @@ def rerank(question: str, hits: List[Dict[str, Any]], top_k: int = RETRIEVE_TOP_
     )
 
     try:
-        result = (prompt | get_llm()).invoke({
+        result = (prompt | get_llm(settings.temp_rerank)).invoke({
             "question": question,
             "items": "\n".join(items_text),
         })
         text = _clean_json(result.content)
-        # 提取编号列表
         start, end = text.find("["), text.rfind("]")
         if start != -1 and end != -1:
             text = text[start : end + 1]
         ranked_indices = json.loads(text)
 
-        # 按编号重新排序，过滤无效编号
+        # 按编号重排，过滤无效编号
         ranked_hits = []
         seen = set()
         for idx in ranked_indices:
@@ -168,14 +151,14 @@ def rerank(question: str, hits: List[Dict[str, Any]], top_k: int = RETRIEVE_TOP_
                 seen.add(idx)
                 ranked_hits.append(hits[idx - 1])
 
-        # 补充 LLM 漏掉的结果
+        # 补回 LLM 漏掉的结果，避免丢失
         for i, h in enumerate(hits):
             if (i + 1) not in seen:
                 ranked_hits.append(h)
 
-        print(f"[rerank] 重排完成，保留 top-{top_k}")
+        logger.info(f"精排完成，保留 top-{top_k}")
         return ranked_hits[:top_k]
 
     except Exception as e:
-        print(f"[rerank] 重排失败，使用原始排序: {e}")
+        logger.warning(f"精排失败，回退向量粗排顺序: {e}")
         return hits[:top_k]
