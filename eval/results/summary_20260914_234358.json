@@ -1,0 +1,77 @@
+{
+  "snapshot": {
+    "timestamp": "2026-09-14 23:40:01",
+    "collection": "langgraph_rag_kb",
+    "metric": "COSINE",
+    "embedding_model": "text-embedding-v3",
+    "embedding_dim": 512,
+    "retrieve_top_k": 4,
+    "rewrite_num_queries": 3,
+    "temp_rewrite": 0.5,
+    "temp_rerank": 0.0,
+    "total_chunks": 116,
+    "git_commit": "3b0a53d",
+    "chunks_per_source": {
+      "10_messages_conversation.md": 3,
+      "11_embedding_similarity.md": 2,
+      "12_vector_store_ann.md": 2,
+      "13_retrieval_strategy.md": 2,
+      "14_tool_calling_mcp.md": 3,
+      "15_prompt_temperature.md": 2,
+      "20_docker_concepts.md": 19,
+      "21_docker_compose_review.md": 32,
+      "22_docker_qa.md": 21,
+      "30_rag_pipeline.md": 10,
+      "31_langgraph_agent_design.md": 18,
+      "langgraph_intro.md": 2
+    }
+  },
+  "n_answerable": 25,
+  "n_out_of_scope": 5,
+  "repeat": 3,
+  "top_k": 4,
+  "metrics": {
+    "A": {
+      "hit_mean": 0.88,
+      "hit_min": 0.88,
+      "hit_max": 0.88,
+      "mrr_mean": 0.8,
+      "mrr_min": 0.8,
+      "mrr_max": 0.8,
+      "runs": 1
+    },
+    "A_prime": {
+      "hit_mean": 0.9067,
+      "hit_min": 0.84,
+      "hit_max": 0.96,
+      "mrr_mean": 0.7533,
+      "mrr_min": 0.7,
+      "mrr_max": 0.8333,
+      "runs": 3
+    },
+    "B": {
+      "hit_mean": 1.0,
+      "hit_min": 1.0,
+      "hit_max": 1.0,
+      "mrr_mean": 0.8089,
+      "mrr_min": 0.7933,
+      "mrr_max": 0.8267,
+      "runs": 3
+    },
+    "C": {
+      "hit_mean": 1.0,
+      "hit_min": 1.0,
+      "hit_max": 1.0,
+      "mrr_mean": 0.8422,
+      "mrr_min": 0.8333,
+      "mrr_max": 0.8467,
+      "runs": 3
+    }
+  },
+  "config_D_full_graph": null,
+  "diagnosis": {
+    "pool_chunk_avg": 7.08,
+    "pool_doc_avg": 3.28,
+    "rerank_skip": "1/25 题（候选<=top_k 时 C 退化为 B）"
+  }
+}

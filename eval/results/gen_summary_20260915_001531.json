@@ -1,0 +1,22 @@
+{
+  "snapshot": {
+    "timestamp": "2026-09-15 00:15:30",
+    "collection": "langgraph_rag_kb",
+    "embedding_model": "text-embedding-v3",
+    "embedding_dim": 512,
+    "total_chunks": 116,
+    "temp_answer": 0.2,
+    "temp_eval": 0.1,
+    "git_commit": "3b0a53d"
+  },
+  "citation": {
+    "n": 25,
+    "marker_rate": 1.0,
+    "precision": 0.6533,
+    "cover_rate": 1.0
+  },
+  "rejection": {
+    "n": 5,
+    "reject_rate": 1.0
+  }
+}
